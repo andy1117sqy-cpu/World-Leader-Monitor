@@ -94,6 +94,14 @@ export type TurnPace = 'auto' | '1m' | '3m' | '6m' | '1y';
 
 export type MapLayer = 'political' | 'diplomatic' | 'military';
 
+export type LlmProviderId = 'gemini' | 'openai' | 'anthropic' | 'deepseek' | 'custom';
+
+export interface AvailableProvider {
+  id: LlmProviderId;
+  label: string;
+  model: string;
+}
+
 export interface StartEraOption {
   id: string;
   label: string;

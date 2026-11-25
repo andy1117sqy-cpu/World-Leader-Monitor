@@ -7,7 +7,12 @@ import {
   START_ERA_OPTIONS,
   getInitialTerritoryOverrides,
 } from '../data/countries.ts';
-import type { CountryStats, GameSave } from '../types/game.ts';
+import type {
+  AvailableProvider,
+  CountryStats,
+  GameSave,
+  LlmProviderId,
+} from '../types/game.ts';
 import { STAT_FIELDS, formatDateReadable } from '../utils/format.ts';
 import { WorldMap } from './WorldMap.tsx';
 
@@ -24,6 +29,9 @@ interface LobbyViewProps {
   onResumeGame: (saveId: string) => void;
   onDeleteGame: (saveId: string) => void;
   error: string | null;
+  providers: AvailableProvider[];
+  selectedProvider: LlmProviderId | '';
+  onSelectProvider: (provider: LlmProviderId) => void;
 }
 
 const EMPTY_STATS_INPUT: Record<keyof CountryStats, string> = {
@@ -56,6 +64,9 @@ export const LobbyView: React.FC<LobbyViewProps> = ({
   onResumeGame,
   onDeleteGame,
   error,
+  providers,
+  selectedProvider,
+  onSelectProvider,
 }) => {
   const [selectedCountryId, setSelectedCountryId] = useState<string>('');
   const [selectedStartIso, setSelectedStartIso] = useState<string>(DEFAULT_START_ISO);
@@ -216,9 +227,9 @@ export const LobbyView: React.FC<LobbyViewProps> = ({
               </div>
             </div>
 
-            {/* Row 2: Leader Name + Take Office */}
+            {/* Row 2: Leader Name (+ optional Engine selector) + Take Office */}
             <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-12 items-end">
-              <div className="sm:col-span-9">
+              <div className={providers.length > 1 ? 'sm:col-span-5' : 'sm:col-span-9'}>
                 <label
                   htmlFor="leader-name"
                   className="block text-xs font-medium text-[#374151]"
@@ -236,6 +247,32 @@ export const LobbyView: React.FC<LobbyViewProps> = ({
                   className="mt-1.5 h-11 w-full rounded-lg border border-[#d4cdc0] bg-[#faf9f5] px-3.5 text-sm text-[#171a1f] placeholder:text-[#8c94a0] transition-colors focus:border-[#173a63] focus:bg-white focus:outline-none"
                 />
               </div>
+
+              {providers.length > 1 && (
+                <div className="sm:col-span-4">
+                  <label
+                    htmlFor="lobby-provider-select"
+                    className="block text-xs font-medium text-[#374151]"
+                  >
+                    AI engine
+                  </label>
+                  <div className="relative mt-1.5">
+                    <select
+                      id="lobby-provider-select"
+                      value={selectedProvider}
+                      onChange={(e) => onSelectProvider(e.target.value as LlmProviderId)}
+                      className="h-11 w-full appearance-none rounded-lg border border-[#d4cdc0] bg-[#faf9f5] pr-9 pl-3.5 text-sm text-[#171a1f] transition-colors focus:border-[#173a63] focus:bg-white focus:outline-none"
+                    >
+                      {providers.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.label}
+                        </option>
+                      ))}
+                    </select>
+                    <ChevronDown className="pointer-events-none absolute top-1/2 right-3 h-4 w-4 -translate-y-1/2 text-[#6b7280]" />
+                  </div>
+                </div>
+              )}
 
               <div className="sm:col-span-3">
                 <button

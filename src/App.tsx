@@ -8,10 +8,12 @@ import {
 import type {
   ActiveCrisis,
   AdministrationStatus,
+  AvailableProvider,
   CountryStats,
   DiplomaticRelation,
   GameSave,
   GovernanceMetrics,
+  LlmProviderId,
   TerritoryOverride,
   TurnPace,
   TurnRecord,
@@ -20,6 +22,8 @@ import type {
 import { deleteSave, loadSaves, upsertSave } from './utils/storage.ts';
 import { LobbyView } from './components/LobbyView.tsx';
 import { GameplayView } from './components/GameplayView.tsx';
+
+const PROVIDER_STORAGE_KEY = 'world_leader_provider_v1';
 
 function createGameId(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -34,10 +38,48 @@ export default function App() {
   const [isProcessingTurn, setIsProcessingTurn] = useState(false);
   const [pendingDirective, setPendingDirective] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [providers, setProviders] = useState<AvailableProvider[]>([]);
+  const [selectedProvider, setSelectedProvider] = useState<LlmProviderId | ''>('');
 
   useEffect(() => {
     setSaves(loadSaves());
+    let cancelled = false;
+    fetch('/api/providers')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((payload: { defaultProvider?: LlmProviderId | null; providers?: AvailableProvider[] } | null) => {
+        if (cancelled || !payload || !Array.isArray(payload.providers)) return;
+        setProviders(payload.providers);
+        let savedChoice: string | null = null;
+        try {
+          savedChoice = localStorage.getItem(PROVIDER_STORAGE_KEY);
+        } catch {
+          savedChoice = null;
+        }
+        const matchSaved = payload.providers.find((p) => p.id === savedChoice);
+        if (matchSaved) {
+          setSelectedProvider(matchSaved.id);
+        } else if (payload.defaultProvider) {
+          setSelectedProvider(payload.defaultProvider);
+        } else if (payload.providers[0]) {
+          setSelectedProvider(payload.providers[0].id);
+        }
+      })
+      .catch(() => {
+        // Provider list falls back to server default automatically
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
+
+  const handleSelectProvider = (providerId: LlmProviderId) => {
+    setSelectedProvider(providerId);
+    try {
+      localStorage.setItem(PROVIDER_STORAGE_KEY, providerId);
+    } catch {
+      // Ignore storage quota errors
+    }
+  };
 
   const activeSave = saves.find((s) => s.id === activeGameId) ?? null;
 
@@ -117,6 +159,7 @@ export default function App() {
           leaderName: params.leaderName,
           stats: params.stats,
           startIsoDate: params.startIsoDate,
+          provider: selectedProvider || undefined,
         }),
       })
         .then((res) => (res.ok ? res.json() : null))
@@ -200,6 +243,7 @@ export default function App() {
           })),
           directive,
           pace,
+          provider: selectedProvider || undefined,
         }),
       });
 
@@ -316,6 +360,9 @@ export default function App() {
             isProcessing={isProcessingTurn}
             pendingDirective={pendingDirective}
             error={error}
+            providers={providers}
+            selectedProvider={selectedProvider}
+            onSelectProvider={handleSelectProvider}
           />
         ) : (
           <LobbyView
@@ -324,6 +371,9 @@ export default function App() {
             onResumeGame={handleResumeGame}
             onDeleteGame={handleDeleteGame}
             error={error}
+            providers={providers}
+            selectedProvider={selectedProvider}
+            onSelectProvider={handleSelectProvider}
           />
         )}
       </main>

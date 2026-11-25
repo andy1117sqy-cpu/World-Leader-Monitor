@@ -2,15 +2,24 @@ import 'dotenv/config';
 import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
+import { Type } from '@google/genai';
 import { COUNTRIES, COUNTRY_BY_ID } from './src/data/countries.ts';
+import {
+  ProviderConfigError,
+  generateStructuredJson,
+  getConfiguredProviders,
+  getDefaultProviderId,
+  resolveRequestedProvider,
+} from './src/server/llmProviders.ts';
 import type {
   ActiveCrisis,
   AdministrationStatus,
   CountryStats,
   DiplomaticRelation,
   GovernanceMetrics,
+  RelationStatus,
   TerritoryOverride,
+  TerritoryStatus,
   TurnPace,
   TurnRecord,
   WorldHeadline,
@@ -19,30 +28,16 @@ import type {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Ultra-low-latency model with MINIMAL thinking (zero thinking delay)
-const MODEL_NAME = 'gemini-3.1-flash-lite';
-
-let cachedAiClient: GoogleGenAI | null = null;
-let cachedApiKey: string | undefined;
-
-function getAiClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
-    throw new Error('GEMINI_API_KEY is not configured. Please set it in Settings > Secrets.');
-  }
-  if (!cachedAiClient || cachedApiKey !== apiKey) {
-    cachedApiKey = apiKey;
-    cachedAiClient = new GoogleGenAI({
-      apiKey,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        },
-      },
-    });
-  }
-  return cachedAiClient;
-}
+const VALID_RELATION_STATUSES = new Set<RelationStatus>([
+  'ally', 'partner', 'neutral', 'tense', 'sanctioned', 'war',
+]);
+const VALID_SEVERITIES = new Set<ActiveCrisis['severity']>(['low', 'elevated', 'critical']);
+const VALID_TERRITORY_STATUSES = new Set<TerritoryStatus>([
+  'annexed', 'occupied', 'puppet', 'disputed', 'union', 'independent',
+]);
+const VALID_ADMIN_STATUSES = new Set<AdministrationStatus>([
+  'active', 'ousted', 'resigned', 'conquered',
+]);
 
 const MAJOR_POWER_IDS = [
   '840', '156', '643', '276', '826', '250', '356', '392',
@@ -164,23 +159,31 @@ function sanitizeGovernance(
   };
 }
 
-async function callGeminiWithRetry<T>(fn: () => Promise<T>, maxAttempts = 2): Promise<T> {
-  let lastError: unknown;
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      return await fn();
-    } catch (err) {
-      lastError = err;
-      const msg = err instanceof Error ? err.message : String(err);
-      const isTransient = msg.includes('503') || msg.includes('500') || msg.includes('UNAVAILABLE');
-      if (!isTransient || attempt === maxAttempts) {
-        throw err;
-      }
-      await new Promise((r) => setTimeout(r, 450 * attempt));
-    }
-  }
-  throw lastError;
-}
+const BRIEFING_JSON_CONTRACT = `Output strictly valid JSON matching this schema:
+{
+  "headline": "string (6-11 words)",
+  "narrative": "string (2 concise paragraphs separated by \\n\\n)",
+  "worldHeadlines": [{"dateline": "CITY", "text": "string", "countryId": "3-digit ID from IDs list"}],
+  "activeEvents": [{"id": "slug", "title": "string", "severity": "low|elevated|critical", "summary": "string"}],
+  "relations": [{"countryId": "3-digit ID", "countryName": "string", "status": "ally|partner|neutral|tense|sanctioned|war", "note": "short reason"}],
+  "suggestedDirectives": ["string", "string", "string"]
+}`;
+
+const TURN_JSON_CONTRACT = `Output strictly valid JSON matching this schema:
+{
+  "nextIsoDate": "YYYY-MM-DD",
+  "headline": "string (6-11 words)",
+  "narrative": "string (2 tight paragraphs, 100-170 words total, separated by \\n\\n)",
+  "worldHeadlines": [{"dateline": "CITY", "text": "string", "countryId": "3-digit ID"}],
+  "newStats": {"population": number, "gdp": number, "unemployment": number, "inflation": number, "armedForces": number, "tanks": number, "fighterJets": number, "aircraftCarriers": number},
+  "newGovernance": {"approval": number, "stability": number, "budgetBalance": number},
+  "territoryChanges": [{"targetId": "3-digit ID", "controllerId": "3-digit ID", "status": "annexed|occupied|puppet|disputed|union|independent", "label": "string"}],
+  "relations": [{"countryId": "3-digit ID", "countryName": "string", "status": "ally|partner|neutral|tense|sanctioned|war", "note": "short reason"}],
+  "activeEvents": [{"id": "slug", "title": "string", "severity": "low|elevated|critical", "summary": "string"}],
+  "suggestedDirectives": ["string", "string", "string"],
+  "administrationStatus": "active|ousted|resigned|conquered",
+  "endVerdict": "optional string only if administrationStatus is not active"
+}`;
 
 const BRIEFING_SCHEMA = {
   type: Type.OBJECT,
@@ -354,14 +357,23 @@ async function startServer() {
     res.json({ ok: true });
   });
 
+  app.get('/api/providers', (_req, res) => {
+    res.json({
+      defaultProvider: getDefaultProviderId(),
+      providers: getConfiguredProviders(),
+    });
+  });
+
   // Optional background enrichment endpoint for alternate historical/future start eras
   app.post('/api/briefing', async (req, res) => {
     try {
-      const { countryId, leaderName, stats, startIsoDate } = req.body as {
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const { countryId, leaderName, stats, startIsoDate, provider } = body as {
         countryId?: string;
         leaderName?: string;
         stats?: CountryStats;
         startIsoDate?: string;
+        provider?: string;
       };
 
       if (!countryId || !COUNTRY_BY_ID[countryId]) {
@@ -369,13 +381,13 @@ async function startServer() {
         return;
       }
 
+      const providerId = resolveRequestedProvider(provider);
       const country = COUNTRY_BY_ID[countryId];
       const safeLeader = (leaderName ?? country.leader).trim().slice(0, 120) || country.leader;
       const safeStats = sanitizeStats(stats ?? country.stats, country.stats);
       const isoDate = startIsoDate && /^\d{4}-\d{2}-\d{2}$/.test(startIsoDate) ? startIsoDate : '2026-01-01';
       const readableDate = formatReadableDate(isoDate);
 
-      const ai = getAiClient();
       const prompt = [
         `Start Date: ${readableDate} (${isoDate}).`,
         `Country: ${country.name} (ID ${country.id}, ${country.region}). Leader: ${safeLeader}.`,
@@ -384,58 +396,73 @@ async function startServer() {
         `IDs: ${buildRelevantCountryIndex(country.id)}`,
       ].join('\n');
 
-      const response = await callGeminiWithRetry(() =>
-        ai.models.generateContent({
-          model: MODEL_NAME,
-          contents: prompt,
-          config: {
-            systemInstruction:
-              'You are the simulation engine for World Leader. Write concise, era-accurate Financial Times / Reuters prose. Use exact country IDs from IDs list.',
-            responseMimeType: 'application/json',
-            responseSchema: BRIEFING_SCHEMA,
-            thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
-          },
-        })
-      );
-
-      const parsed = JSON.parse((response.text ?? '{}').trim()) as {
+      const result = await generateStructuredJson<{
         headline: string;
         narrative: string;
         worldHeadlines: WorldHeadline[];
         activeEvents: ActiveCrisis[];
         relations: DiplomaticRelation[];
         suggestedDirectives: string[];
-      };
+      }>({
+        providerId,
+        systemInstruction:
+          'You are the simulation engine for World Leader. Write concise, era-accurate Financial Times / Reuters prose. Use exact country IDs from IDs list.',
+        userPrompt: prompt,
+        geminiSchema: BRIEFING_SCHEMA,
+        jsonContract: BRIEFING_JSON_CONTRACT,
+      });
 
-      const cleanRelations: DiplomaticRelation[] = (parsed.relations ?? [])
+      const parsed = result.data;
+
+      const cleanRelations: DiplomaticRelation[] = (Array.isArray(parsed.relations) ? parsed.relations : [])
         .map((r) => {
           const cid = resolveCountryId(r.countryId) ?? resolveCountryId(r.countryName);
           if (!cid || cid === countryId) return null;
+          const safeStatus: RelationStatus = VALID_RELATION_STATUSES.has(r.status) ? r.status : 'neutral';
           return {
             countryId: cid,
             countryName: COUNTRY_BY_ID[cid]?.name ?? r.countryName,
-            status: r.status,
+            status: safeStatus,
             note: String(r.note ?? '').slice(0, 120),
           };
         })
         .filter((x): x is DiplomaticRelation => x !== null)
         .slice(0, 14);
 
-      const cleanHeadlines: WorldHeadline[] = (parsed.worldHeadlines ?? []).slice(0, 3).map((h) => ({
-        dateline: String(h.dateline ?? 'WORLD').toUpperCase().slice(0, 24),
-        text: String(h.text ?? '').slice(0, 180),
-        countryId: resolveCountryId(h.countryId),
-      }));
+      const cleanHeadlines: WorldHeadline[] = (Array.isArray(parsed.worldHeadlines) ? parsed.worldHeadlines : [])
+        .slice(0, 3)
+        .map((h) => ({
+          dateline: String(h.dateline ?? 'WORLD').toUpperCase().slice(0, 24),
+          text: String(h.text ?? '').slice(0, 180),
+          countryId: resolveCountryId(h.countryId),
+        }));
+
+      const cleanEvents: ActiveCrisis[] = (Array.isArray(parsed.activeEvents) ? parsed.activeEvents : [])
+        .slice(0, 3)
+        .map((ev, idx) => ({
+          id: String(ev.id || `event-${idx + 1}`).slice(0, 60),
+          title: String(ev.title || 'Developing situation').slice(0, 120),
+          severity: VALID_SEVERITIES.has(ev.severity) ? ev.severity : 'elevated',
+          summary: String(ev.summary || '').slice(0, 240),
+        }));
 
       res.json({
         headline: parsed.headline || `${safeLeader} takes office in ${country.name}`,
         narrative: parsed.narrative || '',
         worldHeadlines: cleanHeadlines,
-        activeEvents: (parsed.activeEvents ?? []).slice(0, 3),
+        activeEvents: cleanEvents,
         relations: cleanRelations,
-        suggestedDirectives: (parsed.suggestedDirectives ?? []).slice(0, 3),
+        suggestedDirectives: (Array.isArray(parsed.suggestedDirectives) ? parsed.suggestedDirectives : [])
+          .map((d) => String(d).slice(0, 200))
+          .slice(0, 3),
+        provider: result.provider,
+        model: result.model,
       });
     } catch (err) {
+      if (err instanceof ProviderConfigError) {
+        res.status(err.statusCode).json({ error: err.message });
+        return;
+      }
       console.error('Error in /api/briefing:', err);
       const message = err instanceof Error ? err.message : 'Failed to generate briefing.';
       res.status(500).json({ error: message });
@@ -444,6 +471,7 @@ async function startServer() {
 
   app.post('/api/turn', async (req, res) => {
     try {
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
       const {
         countryId,
         leaderName,
@@ -457,7 +485,8 @@ async function startServer() {
         recentTurns,
         directive,
         pace,
-      } = req.body as {
+        provider,
+      } = body as {
         countryId?: string;
         leaderName?: string;
         currentIsoDate?: string;
@@ -470,6 +499,7 @@ async function startServer() {
         recentTurns?: Array<{ turn: number; date: string; directive: string; headline: string }>;
         directive?: string;
         pace?: TurnPace;
+        provider?: string;
       };
 
       if (!countryId || !COUNTRY_BY_ID[countryId]) {
@@ -487,6 +517,7 @@ async function startServer() {
         return;
       }
 
+      const providerId = resolveRequestedProvider(provider);
       const country = COUNTRY_BY_ID[countryId];
       const safeStats = sanitizeStats(stats ?? country.stats, country.stats);
       const safeGov = sanitizeGovernance(governance ?? country.governance, country.governance);
@@ -540,28 +571,7 @@ async function startServer() {
         .filter(Boolean)
         .join('\n');
 
-      const ai = getAiClient();
-
-      const response = await callGeminiWithRetry(() =>
-        ai.models.generateContent({
-          model: MODEL_NAME,
-          contents: prompt,
-          config: {
-            systemInstruction: [
-              'You are the geopolitical simulation engine for World Leader. Simulate realistic consequences in crisp Financial Times / Reuters prose (2 tight paragraphs).',
-              'Institutions, markets, voters, and foreign capitals push back realistically. Military procurement takes realistic time and budget. Update all 8 newStats and newGovernance proportionally.',
-              'Multilateral diplomacy: nations routinely maintain many allies, many partners, and multiple rivals simultaneously. In relations, return any relationships newly created or changed this turn (existing unchanged allies and partners are preserved automatically).',
-              'If borders, occupation, annexation, political union, or independence change, emit territoryChanges using exact IDs from IDs list; otherwise [].',
-              'Keep administrationStatus "active" unless the leader genuinely resigns, loses office, is couped, or is conquered.',
-            ].join(' '),
-            responseMimeType: 'application/json',
-            responseSchema: TURN_SCHEMA,
-            thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
-          },
-        })
-      );
-
-      const parsed = JSON.parse((response.text ?? '{}').trim()) as {
+      const result = await generateStructuredJson<{
         nextIsoDate?: string;
         headline: string;
         narrative: string;
@@ -574,7 +584,21 @@ async function startServer() {
         suggestedDirectives: string[];
         administrationStatus: AdministrationStatus;
         endVerdict?: string;
-      };
+      }>({
+        providerId,
+        systemInstruction: [
+          'You are the geopolitical simulation engine for World Leader. Simulate realistic consequences in crisp Financial Times / Reuters prose (2 tight paragraphs).',
+          'Institutions, markets, voters, and foreign capitals push back realistically. Military procurement takes realistic time and budget. Update all 8 newStats and newGovernance proportionally.',
+          'Multilateral diplomacy: nations routinely maintain many allies, many partners, and multiple rivals simultaneously. In relations, return any relationships newly created or changed this turn (existing unchanged allies and partners are preserved automatically).',
+          'If borders, occupation, annexation, political union, or independence change, emit territoryChanges using exact IDs from IDs list; otherwise [].',
+          'Keep administrationStatus "active" unless the leader genuinely resigns, loses office, is couped, or is conquered.',
+        ].join(' '),
+        userPrompt: prompt,
+        geminiSchema: TURN_SCHEMA,
+        jsonContract: TURN_JSON_CONTRACT,
+      });
+
+      const parsed = result.data;
 
       let nextIso =
         parsed.nextIsoDate && /^\d{4}-\d{2}-\d{2}$/.test(parsed.nextIsoDate)
@@ -608,30 +632,32 @@ async function startServer() {
         budgetBalance: roundTo(nextGov.budgetBalance - safeGov.budgetBalance, 1),
       };
 
-      const validTerritoryChanges: TerritoryOverride[] = (parsed.territoryChanges ?? [])
+      const validTerritoryChanges: TerritoryOverride[] = (Array.isArray(parsed.territoryChanges) ? parsed.territoryChanges : [])
         .map((tc) => {
           const targetId = resolveCountryId(tc.targetId);
           const controllerId = resolveCountryId(tc.controllerId);
           if (!targetId || !controllerId) return null;
+          const safeStatus: TerritoryStatus = VALID_TERRITORY_STATUSES.has(tc.status) ? tc.status : 'disputed';
           return {
             targetId,
             controllerId,
-            status: tc.status,
+            status: safeStatus,
             label: String(
-              tc.label ?? `${tc.status} by ${COUNTRY_BY_ID[controllerId]?.name ?? controllerId}`
+              tc.label ?? `${safeStatus} by ${COUNTRY_BY_ID[controllerId]?.name ?? controllerId}`
             ).slice(0, 100),
           };
         })
         .filter((x): x is TerritoryOverride => x !== null);
 
-      const incomingRelations: DiplomaticRelation[] = (parsed.relations ?? [])
+      const incomingRelations: DiplomaticRelation[] = (Array.isArray(parsed.relations) ? parsed.relations : [])
         .map((r) => {
           const cid = resolveCountryId(r.countryId) ?? resolveCountryId(r.countryName);
           if (!cid || cid === countryId) return null;
+          const safeStatus: RelationStatus = VALID_RELATION_STATUSES.has(r.status) ? r.status : 'neutral';
           return {
             countryId: cid,
             countryName: COUNTRY_BY_ID[cid]?.name ?? r.countryName,
-            status: r.status,
+            status: safeStatus,
             note: String(r.note ?? '').slice(0, 120),
           };
         })
@@ -649,11 +675,26 @@ async function startServer() {
       }
       const mergedRelations = Array.from(mergedMap.values()).slice(0, 30);
 
-      const validHeadlines: WorldHeadline[] = (parsed.worldHeadlines ?? []).slice(0, 3).map((h) => ({
-        dateline: String(h.dateline ?? 'WORLD').toUpperCase().slice(0, 24),
-        text: String(h.text ?? '').slice(0, 180),
-        countryId: resolveCountryId(h.countryId),
-      }));
+      const validHeadlines: WorldHeadline[] = (Array.isArray(parsed.worldHeadlines) ? parsed.worldHeadlines : [])
+        .slice(0, 3)
+        .map((h) => ({
+          dateline: String(h.dateline ?? 'WORLD').toUpperCase().slice(0, 24),
+          text: String(h.text ?? '').slice(0, 180),
+          countryId: resolveCountryId(h.countryId),
+        }));
+
+      const validEvents: ActiveCrisis[] = (Array.isArray(parsed.activeEvents) ? parsed.activeEvents : [])
+        .slice(0, 4)
+        .map((ev, idx) => ({
+          id: String(ev.id || `event-${nextTurnNum}-${idx + 1}`).slice(0, 60),
+          title: String(ev.title || 'Developing situation').slice(0, 120),
+          severity: VALID_SEVERITIES.has(ev.severity) ? ev.severity : 'elevated',
+          summary: String(ev.summary || '').slice(0, 240),
+        }));
+
+      const safeAdminStatus: AdministrationStatus = VALID_ADMIN_STATUSES.has(parsed.administrationStatus)
+        ? parsed.administrationStatus
+        : 'active';
 
       const turnRecord: TurnRecord = {
         turn: nextTurnNum,
@@ -666,7 +707,9 @@ async function startServer() {
         statDeltas,
         governanceDeltas,
         territoryChanges: validTerritoryChanges,
-        suggestedDirectives: (parsed.suggestedDirectives ?? []).slice(0, 3),
+        suggestedDirectives: (Array.isArray(parsed.suggestedDirectives) ? parsed.suggestedDirectives : [])
+          .map((d) => String(d).slice(0, 200))
+          .slice(0, 3),
         statsSnapshot: nextStats,
         governanceSnapshot: nextGov,
       };
@@ -676,11 +719,17 @@ async function startServer() {
         newStats: nextStats,
         newGovernance: nextGov,
         relations: mergedRelations,
-        activeEvents: (parsed.activeEvents ?? []).slice(0, 4),
-        administrationStatus: parsed.administrationStatus || 'active',
-        endVerdict: parsed.endVerdict || undefined,
+        activeEvents: validEvents,
+        administrationStatus: safeAdminStatus,
+        endVerdict: parsed.endVerdict ? String(parsed.endVerdict).slice(0, 400) : undefined,
+        provider: result.provider,
+        model: result.model,
       });
     } catch (err) {
+      if (err instanceof ProviderConfigError) {
+        res.status(err.statusCode).json({ error: err.message });
+        return;
+      }
       console.error('Error in /api/turn:', err);
       const message = err instanceof Error ? err.message : 'Simulation turn failed. Please try again.';
       res.status(500).json({ error: message });

@@ -2,7 +2,9 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Loader2, Maximize2, Minimize2, ArrowRight, RotateCcw } from 'lucide-react';
 import { COUNTRY_BY_ID } from '../data/countries.ts';
 import type {
+  AvailableProvider,
   GameSave,
+  LlmProviderId,
   RelationStatus,
   TurnPace,
   TurnRecord,
@@ -22,6 +24,9 @@ interface GameplayViewProps {
   isProcessing: boolean;
   pendingDirective: string | null;
   error: string | null;
+  providers: AvailableProvider[];
+  selectedProvider: LlmProviderId | '';
+  onSelectProvider: (provider: LlmProviderId) => void;
 }
 
 type SideTab = 'diplomacy' | 'events' | 'trends';
@@ -62,6 +67,9 @@ export const GameplayView: React.FC<GameplayViewProps> = ({
   isProcessing,
   pendingDirective,
   error,
+  providers,
+  selectedProvider,
+  onSelectProvider,
 }) => {
   const [directive, setDirective] = useState('');
   const [pace, setPace] = useState<TurnPace>('auto');
@@ -420,22 +428,43 @@ export const GameplayView: React.FC<GameplayViewProps> = ({
               )}
 
               <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
-                <div className="flex items-center gap-1 rounded-lg border border-[#ddd6c9] bg-white p-1">
-                  <span className="px-2 text-[11px] text-[#6b7280]">Pace</span>
-                  {PACE_OPTIONS.map((opt) => (
-                    <button
-                      key={opt.value}
-                      type="button"
-                      onClick={() => setPace(opt.value)}
-                      className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
-                        pace === opt.value
-                          ? 'bg-[#173a63] text-white'
-                          : 'text-[#5b6573] hover:bg-[#f2efe8] hover:text-[#171a1f]'
-                      }`}
-                    >
-                      {opt.label}
-                    </button>
-                  ))}
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="flex items-center gap-1 rounded-lg border border-[#ddd6c9] bg-white p-1">
+                    <span className="px-2 text-[11px] text-[#6b7280]">Pace</span>
+                    {PACE_OPTIONS.map((opt) => (
+                      <button
+                        key={opt.value}
+                        type="button"
+                        onClick={() => setPace(opt.value)}
+                        className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                          pace === opt.value
+                            ? 'bg-[#173a63] text-white'
+                            : 'text-[#5b6573] hover:bg-[#f2efe8] hover:text-[#171a1f]'
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  {providers.length > 1 && (
+                    <label className="flex items-center gap-1.5 rounded-lg border border-[#ddd6c9] bg-white px-2.5 py-1 text-xs text-[#5b6573]">
+                      <span className="text-[11px] text-[#6b7280]">Engine</span>
+                      <select
+                        aria-label="AI engine"
+                        value={selectedProvider}
+                        disabled={isProcessing}
+                        onChange={(e) => onSelectProvider(e.target.value as LlmProviderId)}
+                        className="bg-transparent font-medium text-[#171a1f] focus:outline-none disabled:opacity-60"
+                      >
+                        {providers.map((p) => (
+                          <option key={p.id} value={p.id}>
+                            {p.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  )}
                 </div>
 
                 <div className="flex items-center gap-3">
