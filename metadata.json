@@ -1,0 +1,6 @@
+{
+  "name": "World Leader",
+  "description": "Lead any country starting 1 February 2025. Write what your government does; the world map and national figures respond to every decision.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
